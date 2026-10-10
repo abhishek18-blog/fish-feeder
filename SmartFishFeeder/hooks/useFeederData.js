@@ -222,7 +222,7 @@ export default function useFeederData() {
       } catch (e) {
         // ignore
       }
-    }, 10000);
+    }, 20000);
 
     // 2. Send SINGLE atomic update packet to Firebase Realtime Database (instant!)
     await update(ref(db, 'feeder'), {

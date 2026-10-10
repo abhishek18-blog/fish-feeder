@@ -96,7 +96,33 @@ int currentPortionSize = 1;
 float currentDistanceCm = 1.0f;
 bool sensorConnected = false;
 bool isDispensingNow = false;
-int lastFeedCommandCount = -1;
+int lastFeedCommand = 0;           // Last feedCommand ID we already handled
+bool feedCommandPrimed = false;    // True once we know the current ID (avoids replaying old feeds on boot)
+int fbFailCount = 0;               // Consecutive failed Firebase requests
+
+/**
+ * Tracks Firebase health. If requests keep failing (SSL session died while Wi-Fi
+ * is still up, heap exhausted, etc.) we rebuild the connection, and as a last
+ * resort reboot, so the feeder always recovers on its own.
+ */
+void noteFirebaseResult(bool ok) {
+  if (ok) { fbFailCount = 0; return; }
+  fbFailCount++;
+  Serial.print("⚠️ [FIREBASE] Request failed (");
+  Serial.print(fbFailCount);
+  Serial.print("): ");
+  Serial.println(fbdo.errorReason());
+  if (fbFailCount == 5) {
+    Serial.println("🔄 [FIREBASE] Rebuilding connection...");
+    fbdo.clear();
+    Firebase.begin(&config, &auth);
+  }
+  if (fbFailCount >= 15) {
+    Serial.println("🔁 [FIREBASE] Unrecoverable — restarting ESP.");
+    delay(200);
+    ESP.restart();
+  }
+}
 
 // ------------------------------------------------------------------------------
 // 7. Genuine Ultrasonic Ping Functions
@@ -309,10 +335,12 @@ void dispenseFood(int portionSize, String feedLabel = "Manual Feed", String feed
 
   // ── 4. Immediately unlock App UI ("Ready") with retry ────────────────────
   String spinStr = String(portionSize * 1.5f, 1) + "s servo spin";
-  if (!Firebase.setString(fbdo, "/feeder/servoStatus", "Ready")) {
-    delay(100);
-    Firebase.setString(fbdo, "/feeder/servoStatus", "Ready");
+  bool readyOk = false;
+  for (int attempt = 0; attempt < 4 && !readyOk; attempt++) {
+    readyOk = Firebase.setString(fbdo, "/feeder/servoStatus", "Ready");
+    if (!readyOk) { delay(200); yield(); }
   }
+  noteFirebaseResult(readyOk);
 
   // Wait 800ms for food surface to settle, then take genuine ultrasonic ping
   delay(800);
@@ -523,6 +551,7 @@ void setup() {
   Serial.print("Connecting to Wi-Fi SSID: ");
   Serial.println(WIFI_SSID);
   WiFi.mode(WIFI_STA);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP); // Wi-Fi modem sleep makes the ESP miss commands
   WiFi.disconnect();
   delay(100);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -614,6 +643,12 @@ void setup() {
     if (p >= 1 && p <= 5) currentPortionSize = p;
   }
 
+  // Remember the current command ID so an old tap isn't replayed after a reboot
+  if (Firebase.getInt(fbdo, "/feeder/feedCommand")) {
+    lastFeedCommand = fbdo.intData();
+    feedCommandPrimed = true;
+  }
+
   // 5. Download Schedules immediately on boot
   syncSchedulesFromFirebase();
 
@@ -635,16 +670,49 @@ void loop() {
 
   unsigned long nowMs = millis();
 
-  // ── 1. Check for "Feed Now" every 300ms (ONLY 1 lightweight GET!) ─────────
-  // Because we don't clog the socket with 3 GETs per loop, this responds in ~150ms!
-  if (nowMs - lastPoll >= 300) {
+  // ── 1. Check for "Feed Now" every 400ms ────────────────────────────────────
+  // The app writes a NEW unique feedCommand ID on every tap. We act whenever the
+  // ID differs from the last one we handled. Unlike the old "servoStatus ==
+  // Dispensing" check, this can't be lost if the ESP was busy (sensor / schedule
+  // sync) or if the app's timeout reset servoStatus to "Ready" in the meantime.
+  if (nowMs - lastPoll >= 400) {
     lastPoll = nowMs;
 
-    if (!isDispensingNow && Firebase.getString(fbdo, "/feeder/servoStatus")) {
-      if (fbdo.stringData() == "Dispensing") {
-        Serial.println("⚡ [FEED NOW] Instant trigger received from App!");
-        dispenseFood(currentPortionSize, "Manual Feed", "manual");
+    if (!isDispensingNow) {
+      bool ok = Firebase.getInt(fbdo, "/feeder/feedCommand");
+      noteFirebaseResult(ok);
+
+      if (ok) {
+        int cmd = fbdo.intData();
+        if (!feedCommandPrimed) {
+          lastFeedCommand = cmd;
+          feedCommandPrimed = true;
+        } else if (cmd != lastFeedCommand) {
+          lastFeedCommand = cmd;
+          Serial.println("⚡ [FEED NOW] New command received from App!");
+
+          // Portion is written by the app together with the command — read it fresh
+          if (Firebase.getInt(fbdo, "/feeder/portionSize")) {
+            int p = fbdo.intData();
+            if (p >= 1 && p <= 5) currentPortionSize = p;
+          }
+          dispenseFood(currentPortionSize, "Manual Feed", "manual");
+        }
       }
+    }
+  }
+
+  // ── Memory watchdog: SSL needs plenty of heap; reboot before we hang ──────
+  static unsigned long lastHeapCheck = 0;
+  if (nowMs - lastHeapCheck >= 5000) {
+    lastHeapCheck = nowMs;
+    uint32_t heap = ESP.getFreeHeap();
+    if (heap < 9000 && !isDispensingNow) {
+      Serial.print("🧠 [HEAP] Low memory (");
+      Serial.print(heap);
+      Serial.println(" bytes) — restarting to recover.");
+      delay(200);
+      ESP.restart();
     }
   }
 

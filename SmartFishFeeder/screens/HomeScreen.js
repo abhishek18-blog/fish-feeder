@@ -61,12 +61,10 @@ export default function HomeScreen({
   const [feeding, setFeeding] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
 
-  // Synchronize local feeding spinner with real hardware servo status
+  // Clear spinner as soon as hardware reports Ready
   useEffect(() => {
     if (feederData.servoStatus === 'Ready') {
       setFeeding(false);
-    } else if (feederData.servoStatus === 'Dispensing') {
-      setFeeding(true);
     }
   }, [feederData.servoStatus]);
 
@@ -81,12 +79,15 @@ export default function HomeScreen({
 
   // Instant feed without confirmation popup — directly takes existing portion
   const handleFeedNow = async () => {
-    if (feederData.servoStatus === 'Dispensing' || feeding) return;
+    if (feeding) return;
     setFeeding(true);
+    const maxSpinMs = (feederData.portionSize || 1) * 1600 + 3000;
+    const localTimer = setTimeout(() => setFeeding(false), maxSpinMs);
     try {
       await feedNow();
     } catch (e) {
       console.warn('Feed error:', e);
+      clearTimeout(localTimer);
       setFeeding(false);
     }
   };
@@ -98,7 +99,7 @@ export default function HomeScreen({
       })
     : '--:--';
 
-  const isDispensing = feeding || feederData.servoStatus === 'Dispensing';
+  const isDispensing = feeding;
 
   return (
     <ScrollView

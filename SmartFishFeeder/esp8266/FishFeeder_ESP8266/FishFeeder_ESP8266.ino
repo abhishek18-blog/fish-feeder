@@ -310,24 +310,25 @@ void dispenseFood(int portionSize, String feedLabel = "Manual Feed", String feed
   setDispensingLEDs();
   digitalWrite(LED_PIN, LOW); // Onboard LED ON
 
-  // ── 2. Full-Arc Servo Sweep (Works on BOTH 180° SG90 & 360° Servos!) ─────
-  // Sweeping 180° -> 0° -> 90° with full travel time guarantees the motor
-  // physically moves back and forth on EVERY press and never gets stuck at 180°.
-  feederServo.attach(SERVO_PIN, 500, 2400);
-  delay(30);
+  // ── 2. 360° Continuous Servo: Uninterrupted Clockwise Circles ────────────
+  // 1x portion = 1 full 360° clockwise circle (1500 ms)
+  // 2x portion = 2 full 360° clockwise circles (3000 ms), etc.
+  unsigned long spinDurationMs = (unsigned long)portionSize * 1500UL;
 
-  for (int p = 0; p < portionSize; p++) {
-    feederServo.write(180);      // Swing to 180° (or spin forward)
-    waitWithGreenBlink(650);     // Wait 650ms while blinking Green LED
+  feederServo.attach(SERVO_PIN);
 
-    feederServo.write(0);        // Swing back to 0° (un-jams & completes stroke)
-    waitWithGreenBlink(650);     // Wait 650ms while blinking Green LED
+  unsigned long start = millis();
+  while (millis() - start < spinDurationMs) {
+    feederServo.write(0); // 0 = Full-speed Clockwise on 360° continuous servo
+    tickGreenBlink();     // Blink Green LED on D1 while spinning
+    delay(20);
+    yield();
   }
 
-  // Return to neutral 90° and give physical gears 400ms to reach position before detach
-  feederServo.write(90);
-  waitWithGreenBlink(400);
-  feederServo.detach();
+  // Stop rotation only AFTER all portion circles are finished
+  feederServo.write(90);  // 90 = STOP on 360° continuous rotation servo
+  delay(150);
+  feederServo.detach();   // Detach to stop motor humming while idle
 
   // ── 3. LED: Green OFF (D1), Red back ON (D2 - idle) ──────────────────────
   setIdleLEDs();

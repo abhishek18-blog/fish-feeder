@@ -69,6 +69,8 @@ export default function useFeederData() {
 
   // Safety timer ref to prevent UI getting stuck if hardware is disconnected
   const safetyTimeoutRef = useRef(null);
+  // Tracks when the user actually tapped "Feed Now" in this app session
+  const lastTapTimeRef = useRef(0);
 
   // ── 1. Realtime Database Listeners (Fast hardware sync) ───────────
   useEffect(() => {
@@ -84,6 +86,19 @@ export default function useFeederData() {
                 ? val.nextFeed
                 : computeNextFeed(schedules);
 
+            // Only show "Dispensing" if the user actually tapped Feed Now within the last 10s
+            const isActivelyFeeding =
+              lastTapTimeRef.current > 0 && Date.now() - lastTapTimeRef.current < 10000;
+            const resolvedServoStatus =
+              val.servoStatus === 'Dispensing' && !isActivelyFeeding
+                ? 'Ready'
+                : (val.servoStatus ?? 'Ready');
+
+            // Auto-clean stale "Dispensing" value in Firebase so button is never stuck on startup
+            if (val.servoStatus === 'Dispensing' && !isActivelyFeeding) {
+              set(ref(db, 'feeder/servoStatus'), 'Ready').catch(() => {});
+            }
+
             const updated = {
               foodLevel: typeof val.foodLevel === 'number' ? val.foodLevel : 100,
               foodDistanceCm: typeof val.foodDistanceCm === 'number' ? val.foodDistanceCm : null,
@@ -92,7 +107,7 @@ export default function useFeederData() {
               maxDistanceCm: val.maxDistanceCm ?? 5.0,
               minDistanceCm: val.minDistanceCm ?? 1.0,
               portionSize: val.portionSize ?? 1,
-              servoStatus: val.servoStatus ?? 'Ready',
+              servoStatus: resolvedServoStatus,
               nextFeed: nextFeedVal,
               burnPerDay: val.burnPerDay ?? 6,
               deviceOnline: val.deviceOnline ?? true,
@@ -104,9 +119,12 @@ export default function useFeederData() {
             };
 
             // Clear safety timeout once hardware finishes dispensing
-            if (updated.servoStatus === 'Ready' && safetyTimeoutRef.current) {
-              clearTimeout(safetyTimeoutRef.current);
-              safetyTimeoutRef.current = null;
+            if (updated.servoStatus === 'Ready') {
+              lastTapTimeRef.current = 0;
+              if (safetyTimeoutRef.current) {
+                clearTimeout(safetyTimeoutRef.current);
+                safetyTimeoutRef.current = null;
+              }
             }
 
             // Automatically sync real sensor data to Firestore document
@@ -214,15 +232,20 @@ export default function useFeederData() {
       portion: currentPortion,
     };
 
+    // Mark that the user intentionally tapped Feed Now in this session
+    lastTapTimeRef.current = now;
+
     // 1. Arm safety fallback FIRST so UI never stays stuck even if network lags
     if (safetyTimeoutRef.current) clearTimeout(safetyTimeoutRef.current);
     safetyTimeoutRef.current = setTimeout(async () => {
+      lastTapTimeRef.current = 0;
+      setFeederData((prev) => ({ ...prev, servoStatus: 'Ready' }));
       try {
         await set(ref(db, 'feeder/servoStatus'), 'Ready');
       } catch (e) {
         // ignore
       }
-    }, 20000);
+    }, currentPortion * 1600 + 3500);
 
     // 2. Send SINGLE atomic update packet to Firebase Realtime Database (instant!)
     await update(ref(db, 'feeder'), {

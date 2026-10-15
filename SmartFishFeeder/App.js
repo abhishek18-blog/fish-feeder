@@ -1,7 +1,7 @@
 // App.js — root of the SmartFish Feeder app
-// Safe-area aware bottom tab navigator lifted above Android system navigation bar
+// Firebase Auth gating + safe-area aware bottom tab navigator
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
@@ -10,18 +10,22 @@ import {
   StatusBar,
   ActivityIndicator,
   Platform,
+  Alert,
 } from 'react-native';
 import {
   SafeAreaProvider,
   useSafeAreaInsets,
 } from 'react-native-safe-area-context';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
+import { subscribeAuth, signOutFromFirebase } from './firebase/config';
 import { COLORS } from './theme/colors';
 import useFeederData from './hooks/useFeederData';
 import HomeScreen from './screens/HomeScreen';
 import SchedulesScreen from './screens/SchedulesScreen';
 import LogsScreen from './screens/LogsScreen';
 import CalibrationScreen from './screens/CalibrationScreen';
+import FishDoctorScreen from './screens/FishDoctorScreen';
+import AuthScreen from './screens/AuthScreen';
 
 // ── Tab bar definition ───────────────────────────────────────────────────────
 
@@ -39,6 +43,17 @@ const TABS = [
     icon: (active) => (
       <Ionicons
         name="calendar-outline"
+        size={22}
+        color={active ? COLORS.coral : COLORS.navInactive}
+      />
+    ),
+  },
+  {
+    key: 'doctor',
+    label: 'AI Doctor',
+    icon: (active) => (
+      <Ionicons
+        name="medkit-outline"
         size={22}
         color={active ? COLORS.coral : COLORS.navInactive}
       />
@@ -72,7 +87,6 @@ const TABS = [
 
 function BottomTabBar({ activeTab, onTabPress }) {
   const insets = useSafeAreaInsets();
-  // Ensure enough bottom clearance on Android devices with software navigation buttons
   const bottomPadding = Math.max(insets.bottom, Platform.OS === 'android' ? 24 : 14);
 
   return (
@@ -129,9 +143,9 @@ const tabStyles = StyleSheet.create({
   },
 });
 
-// ── Main Content Container ────────────────────────────────────────────────────
+// ── Main Content Container (shown only when authenticated) ────────────────────
 
-function MainApp() {
+function MainApp({ user }) {
   const [activeTab, setActiveTab] = useState('home');
 
   const {
@@ -148,6 +162,17 @@ function MainApp() {
     deleteSchedule,
   } = useFeederData();
 
+  const handleSignOut = () => {
+    Alert.alert('Sign Out', 'Are you sure you want to sign out?', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Sign Out',
+        style: 'destructive',
+        onPress: () => signOutFromFirebase().catch(() => {}),
+      },
+    ]);
+  };
+
   const renderScreen = () => {
     switch (activeTab) {
       case 'home':
@@ -158,6 +183,8 @@ function MainApp() {
             feedNow={feedNow}
             setPortionSize={setPortionSize}
             refreshSensorReading={refreshSensorReading}
+            user={user}
+            onSignOut={handleSignOut}
           />
         );
       case 'schedules':
@@ -169,6 +196,13 @@ function MainApp() {
             onDelete={deleteSchedule}
             onAdd={addSchedule}
             setVacationMode={setVacationMode}
+          />
+        );
+      case 'doctor':
+        return (
+          <FishDoctorScreen
+            feederData={feederData}
+            setPortionSize={setPortionSize}
           />
         );
       case 'logs':
@@ -205,12 +239,41 @@ function MainApp() {
   );
 }
 
-// ── Root with SafeAreaProvider ────────────────────────────────────────────────
+// ── Root with SafeAreaProvider + Firebase Auth gate ───────────────────────────
+
+function AppRoot() {
+  const [user, setUser] = useState(undefined);
+
+  useEffect(() => {
+    const unsubscribe = subscribeAuth((firebaseUser) => {
+      setUser(firebaseUser ?? null);
+    });
+    return unsubscribe;
+  }, []);
+
+  // Show a brief loading indicator while Firebase checks auth state
+  if (user === undefined) {
+    return (
+      <View style={rootStyles.loadingContainer}>
+        <StatusBar barStyle="dark-content" backgroundColor={COLORS.background} />
+        <Text style={{ fontSize: 48, marginBottom: 16 }}>🐟</Text>
+        <ActivityIndicator size="large" color={COLORS.teal} />
+        <Text style={rootStyles.loadingText}>Loading…</Text>
+      </View>
+    );
+  }
+
+  if (!user) {
+    return <AuthScreen />;
+  }
+
+  return <MainApp user={user} />;
+}
 
 export default function App() {
   return (
     <SafeAreaProvider>
-      <MainApp />
+      <AppRoot />
     </SafeAreaProvider>
   );
 }

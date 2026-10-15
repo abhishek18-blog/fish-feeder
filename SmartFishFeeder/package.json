@@ -1,6 +1,6 @@
 {
   "name": "smart-fish-feeder",
-  "version": "1.0.0",
+  "version": "1.7.0",
   "main": "index.js",
   "scripts": {
     "start": "expo start",

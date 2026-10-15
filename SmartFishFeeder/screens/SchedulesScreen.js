@@ -22,8 +22,22 @@ import { COLORS } from '../theme/colors';
 
 // ── Schedule Card ─────────────────────────────────────────────────────────────
 
+function isSchedulePassedToday(time, ampm) {
+  const now = new Date();
+  const currentMinutes = now.getHours() * 60 + now.getMinutes();
+  const cleanTime = (time || '00:00').trim();
+  let [h, m] = cleanTime.split(':').map(Number);
+  if (isNaN(h)) h = 0;
+  if (isNaN(m)) m = 0;
+  const ap = (ampm || '').trim().toUpperCase();
+  if (ap === 'PM' && h < 12) h += 12;
+  if (ap === 'AM' && h === 12) h = 0;
+  return h * 60 + m <= currentMinutes;
+}
+
 function ScheduleCard({ schedule, onToggle, onDelete }) {
   const { name, time, ampm, frequency, portionSize, spinDuration, active, icon } = schedule;
+  const passedToday = active && isSchedulePassedToday(time, ampm);
 
   return (
     <View style={[cardStyles.card, !active && cardStyles.cardInactive]}>
@@ -42,7 +56,7 @@ function ScheduleCard({ schedule, onToggle, onDelete }) {
               ]}
             />
             <Text style={[cardStyles.statusText, { color: active ? COLORS.online : COLORS.textLight }]}>
-              {active ? 'ACTIVE' : 'PAUSED'}
+              {!active ? 'PAUSED' : passedToday ? 'ACTIVE · DONE TODAY' : 'ACTIVE · UPCOMING'}
             </Text>
           </View>
         </View>

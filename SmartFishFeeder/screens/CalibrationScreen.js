@@ -1,5 +1,5 @@
 // screens/CalibrationScreen.js
-// Device calibration — servo test & ultrasonic sensor calibration
+// Device calibration — real ESP8266 servo test via feedCommand & genuine ultrasonic sensor ping
 
 import React, { useState } from 'react';
 import {
@@ -10,15 +10,13 @@ import {
   ActivityIndicator,
   Alert,
   ScrollView,
-  TextInput,
   Platform,
   StatusBar,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons, MaterialCommunityIcons, Feather } from '@expo/vector-icons';
-import { ref, set } from 'firebase/database';
-import { doc, setDoc } from 'firebase/firestore';
-import { db, firestore } from '../firebase/config';
+import { ref, set, update } from 'firebase/database';
+import { db } from '../firebase/config';
 import { COLORS } from '../theme/colors';
 
 function CalibCard({ title, subtitle, children, iconName, iconColor }) {
@@ -40,63 +38,68 @@ function CalibCard({ title, subtitle, children, iconName, iconColor }) {
 
 export default function CalibrationScreen({ feederData, refreshSensorReading }) {
   const insets = useSafeAreaInsets();
-  const [testSpin, setTestSpin] = useState(1.5);
+  const [portionTest, setPortionTest] = useState(1); // 1x = 1 full 360° spin (1.5s)
   const [testing, setTesting] = useState(false);
-  const [newLevel, setNewLevel] = useState('100');
-  const [saving, setSaving] = useState(false);
   const [pingingSensor, setPingingSensor] = useState(false);
 
+  /**
+   * Real servo test: writes a new feedCommand ID to Firebase so the ESP8266's
+   * actual loop() picks it up and runs dispenseFood() — same path as "Feed Now".
+   */
   const runServoTest = async () => {
+    if (!feederData.deviceOnline) {
+      Alert.alert('Device Offline', 'ESP8266 is not connected. Make sure the feeder is powered on and Wi-Fi is connected.');
+      return;
+    }
     setTesting(true);
     try {
-      await set(ref(db, 'feeder/servoStatus'), 'Dispensing');
-      await set(ref(db, 'feeder/calibrateSpinSeconds'), testSpin);
-      setTimeout(async () => {
-        await set(ref(db, 'feeder/servoStatus'), 'Ready');
+      const commandId = Math.floor(Date.now() / 100) % 2000000000;
+      await update(ref(db, 'feeder'), {
+        feedCommand: commandId,
+        portionSize: portionTest,
+        servoStatus: 'Dispensing',
+      });
+
+      // Wait for hardware to finish (portionTest * 1500ms + buffer)
+      const spinMs = portionTest * 1500 + 2000;
+      setTimeout(() => {
         setTesting(false);
-        Alert.alert('✅ Done', `Servo test spin completed (${testSpin}s)`);
-      }, testSpin * 1000 + 500);
+        Alert.alert(
+          '✅ Servo Test Sent',
+          `Command sent to ESP8266. If device is online, it will spin ${portionTest}x (${(portionTest * 1.5).toFixed(1)}s).`
+        );
+      }, spinMs);
     } catch (e) {
       setTesting(false);
       Alert.alert('Error', e.message);
     }
   };
 
+  /**
+   * Real sensor ping: writes triggerSensorRead = true to Firebase.
+   * ESP8266 detects this in its 15s loop and immediately calls measureAndSyncUltrasonic().
+   * The updated distance & food level flow back through the real-time listener in useFeederData.
+   */
   const handlePingSensor = async () => {
+    if (!feederData.deviceOnline) {
+      Alert.alert('Device Offline', 'ESP8266 must be online to ping the sensor.');
+      return;
+    }
     setPingingSensor(true);
-    if (refreshSensorReading) {
-      await refreshSensorReading();
-    }
-    setTimeout(() => {
+    try {
+      await set(ref(db, 'feeder/triggerSensorRead'), true);
+      // Give ESP8266 up to 3 seconds to respond
+      setTimeout(() => {
+        setPingingSensor(false);
+        Alert.alert(
+          '📡 Ping Sent',
+          `ESP8266 has been asked to take a genuine HC-SR04 reading.\n\nLive reading will update below within a few seconds.`
+        );
+      }, 3000);
+    } catch (e) {
       setPingingSensor(false);
-      Alert.alert('✅ Ping Sent', 'ESP8266 requested to measure ultrasonic distance.');
-    }, 1200);
-  };
-
-  const resetFoodLevel = async () => {
-    const lvl = parseFloat(newLevel);
-    if (isNaN(lvl) || lvl < 0 || lvl > 100) {
-      return Alert.alert('Invalid', 'Enter a value between 0 and 100');
+      Alert.alert('Error', e.message);
     }
-    Alert.alert('Manual Level Override', `Manually override food level to ${lvl}%?`, [
-      { text: 'Cancel', style: 'cancel' },
-      {
-        text: 'Confirm',
-        onPress: async () => {
-          setSaving(true);
-          await set(ref(db, 'feeder/foodLevel'), lvl);
-          try {
-            if (firestore) {
-              await setDoc(doc(firestore, 'feeder', 'main'), { foodLevel: lvl }, { merge: true });
-            }
-          } catch (e) {
-            console.warn('Firestore level reset error:', e);
-          }
-          setSaving(false);
-          Alert.alert('✅ Updated', `Food level set to ${lvl}%`);
-        },
-      },
-    ]);
   };
 
   const topPadding = Math.max(insets.top, Platform.OS === 'android' ? (StatusBar.currentHeight || 24) : 16) + 8;
@@ -182,31 +185,35 @@ export default function CalibrationScreen({ feederData, refreshSensorReading }) 
         </TouchableOpacity>
       </CalibCard>
 
-      {/* Servo test */}
+      {/* Servo test — Real feedCommand to ESP8266 */}
       <CalibCard
         title="Servo Motor Test"
-        subtitle="Manually trigger continuous 360° spin"
+        subtitle="Triggers a real dispense via ESP8266 feedCommand"
         iconName="rotate-3d-variant"
         iconColor={COLORS.tealLight}
       >
-        <Text style={styles.fieldLabel}>Spin Duration: {testSpin.toFixed(1)}s</Text>
+        <Text style={styles.fieldLabel}>Test Portions: {portionTest}x ({(portionTest * 1.5).toFixed(1)}s spin)</Text>
         <View style={styles.spinRow}>
           <TouchableOpacity
             style={styles.spinBtn}
-            onPress={() => setTestSpin((v) => Math.max(0.5, parseFloat((v - 0.5).toFixed(1))))}
+            onPress={() => setPortionTest((v) => Math.max(1, v - 1))}
           >
             <Ionicons name="remove" size={18} color={COLORS.teal} />
           </TouchableOpacity>
           <View style={styles.spinDisplay}>
-            <Text style={styles.spinValue}>{testSpin.toFixed(1)}s</Text>
+            <Text style={styles.spinValue}>{portionTest}x</Text>
           </View>
           <TouchableOpacity
             style={styles.spinBtn}
-            onPress={() => setTestSpin((v) => Math.min(5, parseFloat((v + 0.5).toFixed(1))))}
+            onPress={() => setPortionTest((v) => Math.min(5, v + 1))}
           >
             <Ionicons name="add" size={18} color={COLORS.teal} />
           </TouchableOpacity>
         </View>
+        <Text style={styles.hintText}>
+          Sends a real feedCommand to Firebase → ESP8266 detects it and spins the servo.
+          Device must be online.
+        </Text>
         <TouchableOpacity
           style={[styles.actionBtn, testing && { opacity: 0.7 }]}
           onPress={runServoTest}
@@ -218,43 +225,7 @@ export default function CalibrationScreen({ feederData, refreshSensorReading }) 
           ) : (
             <>
               <MaterialCommunityIcons name="rotate-3d-variant" size={16} color={COLORS.white} />
-              <Text style={styles.actionBtnText}>Run Test Spin</Text>
-            </>
-          )}
-        </TouchableOpacity>
-      </CalibCard>
-
-      {/* Manual Food level override */}
-      <CalibCard
-        title="Manual Level Override"
-        subtitle="Set food level if testing without hardware"
-        iconName="gauge"
-        iconColor={COLORS.coral}
-      >
-        <Text style={styles.fieldLabel}>Current: {feederData.foodLevel}%</Text>
-        <View style={styles.inputRow}>
-          <TextInput
-            style={styles.levelInput}
-            value={newLevel}
-            onChangeText={setNewLevel}
-            keyboardType="numeric"
-            placeholder="0–100"
-            placeholderTextColor={COLORS.textLight}
-          />
-          <Text style={styles.pctSuffix}>%</Text>
-        </View>
-        <TouchableOpacity
-          style={[styles.actionBtn, { backgroundColor: COLORS.coral }, saving && { opacity: 0.7 }]}
-          onPress={resetFoodLevel}
-          disabled={saving}
-          activeOpacity={0.8}
-        >
-          {saving ? (
-            <ActivityIndicator color={COLORS.white} size="small" />
-          ) : (
-            <>
-              <MaterialCommunityIcons name="gauge" size={16} color={COLORS.white} />
-              <Text style={styles.actionBtnText}>Set Manual Level</Text>
+              <Text style={styles.actionBtnText}>Run Servo Test on Hardware</Text>
             </>
           )}
         </TouchableOpacity>
@@ -306,6 +277,14 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: COLORS.textLight,
     marginTop: 2,
+  },
+  hintText: {
+    fontSize: 11.5,
+    color: COLORS.textLight,
+    lineHeight: 16,
+    marginTop: 6,
+    marginBottom: 4,
+    fontStyle: 'italic',
   },
   infoRow: {
     flexDirection: 'row',

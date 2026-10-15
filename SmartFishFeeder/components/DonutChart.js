@@ -13,7 +13,7 @@ const STROKE_WIDTH = 16;
 const RADIUS = (SIZE - STROKE_WIDTH) / 2;
 const CIRCUMFERENCE = 2 * Math.PI * RADIUS;
 
-export default function DonutChart({ percentage = 100, burnPerDay = 6, distanceCm = null }) {
+export default function DonutChart({ percentage = 100, burnPerDay = 6 }) {
   const animatedValue = useRef(new Animated.Value(0)).current;
 
   const validPct = Math.max(0, Math.min(100, Math.round(percentage)));
@@ -80,11 +80,6 @@ export default function DonutChart({ percentage = 100, burnPerDay = 6, distanceC
             ? '~1 Day Left'
             : `~${daysLeft} Days Left`}
         </Text>
-        {distanceCm != null && (
-          <Text style={styles.distanceLabel}>
-            {distanceCm.toFixed(1)} cm / 5.0 cm
-          </Text>
-        )}
       </View>
     </View>
   );

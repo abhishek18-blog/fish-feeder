@@ -45,37 +45,48 @@ export default function FoodLevelChart({
   activeRange = '7D',
   onRangeChange,
 }) {
-  // Build display data from real history if available
+  const cur = typeof currentLevel === 'number' ? Math.max(0, Math.min(100, Math.round(currentLevel))) : 100;
+
+  // Build display data with today's live currentLevel as the final point
   let displayData;
-  if (history && history.length >= 2) {
-    displayData = history.map((h) => (typeof h.level === 'number' ? h.level : 100));
-  } else if (history && history.length === 1) {
-    displayData = [history[0].level, currentLevel];
+  if (history && history.length >= 1) {
+    const histPoints = history.map((h) => (typeof h.level === 'number' ? h.level : 100));
+    displayData = [...histPoints, cur];
   } else {
     // Sensible initial trend ending at currentLevel
-    const cur = typeof currentLevel === 'number' ? currentLevel : 100;
     displayData = [Math.min(100, cur + 20), Math.min(100, cur + 14), Math.min(100, cur + 8), cur];
   }
 
   const result = generatePath(displayData, CHART_WIDTH, CHART_HEIGHT);
   const lastPoint = result.points ? result.points[result.points.length - 1] : null;
-  const todayPct = Math.max(0, Math.min(100, Math.round(displayData[displayData.length - 1])));
 
-  // Dynamic drop calculation
-  const totalDrop = displayData[0] - todayPct;
-  const trendSubtitle =
-    totalDrop > 0
-      ? `~${Math.round(totalDrop)}% drop recorded`
-      : 'Sensor reading stable';
+  // Dynamic date labels for the X-axis timeline
+  const now = new Date();
+  const todayDateStr = now.toLocaleDateString([], { month: 'short', day: 'numeric' });
 
-  // Dynamic projected empty date
+  let startRangeLabel = '7d ago';
+  if (activeRange === '24H') {
+    startRangeLabel = '24h ago';
+  } else if (activeRange === '7D') {
+    const d = new Date(Date.now() - 7 * 86400000);
+    startRangeLabel = d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  } else if (activeRange === '30D') {
+    const d = new Date(Date.now() - 30 * 86400000);
+    startRangeLabel = d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  }
+
+  // Dynamic projected empty calculation for the subtitle
   const burn = burnPerDay > 0 ? burnPerDay : 6;
-  const daysUntilEmpty = Math.max(0, Math.round(todayPct / burn));
+  const daysUntilEmpty = cur > 0 ? Math.max(1, Math.round(cur / burn)) : 0;
   const emptyDate = new Date(Date.now() + daysUntilEmpty * 86400000);
-  const emptyDateText =
-    todayPct === 0
-      ? 'Refill needed'
-      : `${emptyDate.toLocaleDateString([], { month: 'short', day: 'numeric' })} - empty`;
+  const emptyDateStr = emptyDate.toLocaleDateString([], { month: 'short', day: 'numeric' });
+
+  let trendSubtitle = 'Sensor reading stable';
+  if (cur === 0) {
+    trendSubtitle = '⚠️ Hopper empty — refill needed';
+  } else if (daysUntilEmpty > 0) {
+    trendSubtitle = `~${burn}%/day • Est. empty ${emptyDateStr} (~${daysUntilEmpty}d)`;
+  }
 
   return (
     <View style={styles.container}>
@@ -113,8 +124,8 @@ export default function FoodLevelChart({
         {/* Area fill */}
         {result.area && <Path d={result.area} fill="url(#grad)" />}
 
-        {/* Dashed red projection line (last point → empty) */}
-        {lastPoint && (
+        {/* Dashed red projection line (only if container currently has food) */}
+        {lastPoint && cur > 0 && (
           <Line
             x1={lastPoint[0]}
             y1={lastPoint[1]}
@@ -126,22 +137,26 @@ export default function FoodLevelChart({
           />
         )}
 
-        {/* Current level dot */}
+        {/* Today's live reading dot */}
         {lastPoint && (
           <>
-            <Circle cx={lastPoint[0]} cy={lastPoint[1]} r={5} fill={COLORS.tealLight} />
+            <Circle cx={lastPoint[0]} cy={lastPoint[1]} r={5} fill={cur === 0 ? COLORS.coral : COLORS.tealLight} />
             <Circle cx={lastPoint[0]} cy={lastPoint[1]} r={3} fill={COLORS.white} />
           </>
         )}
 
-        {/* End "empty" dot */}
-        <Circle cx={CHART_WIDTH - 2} cy={CHART_HEIGHT - 2} r={4} fill={COLORS.coral} />
+        {/* End "empty" dot (only if projecting future empty) */}
+        {cur > 0 && (
+          <Circle cx={CHART_WIDTH - 2} cy={CHART_HEIGHT - 2} r={4} fill={COLORS.coral} />
+        )}
       </Svg>
 
-      {/* X axis label */}
+      {/* X axis labels (Timeline) */}
       <View style={styles.xRow}>
-        <Text style={styles.xLabel}>{todayPct}%</Text>
-        <Text style={[styles.xLabel, { color: COLORS.coral }]}>{emptyDateText}</Text>
+        <Text style={styles.xLabel}>{startRangeLabel}</Text>
+        <Text style={[styles.xLabel, { fontWeight: '600', color: cur === 0 ? COLORS.coral : COLORS.textDark }]}>
+          Today ({todayDateStr}) · {cur}%
+        </Text>
       </View>
     </View>
   );

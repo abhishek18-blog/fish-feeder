@@ -1,5 +1,5 @@
 // screens/LogsScreen.js
-// Feeding activity log — shows history of dispenses
+// Feeding activity log — shows history of dispenses with delete support
 
 import React from 'react';
 import {
@@ -9,9 +9,13 @@ import {
   FlatList,
   Platform,
   StatusBar,
+  TouchableOpacity,
+  Alert,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { MaterialCommunityIcons, Ionicons } from '@expo/vector-icons';
+import { ref, remove } from 'firebase/database';
+import { db } from '../firebase/config';
 import { COLORS } from '../theme/colors';
 
 function formatDate(ts) {
@@ -22,12 +26,14 @@ function formatDate(ts) {
   if (isToday) {
     return `Today · ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
   }
-  return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) +
+  return (
+    d.toLocaleDateString([], { month: 'short', day: 'numeric' }) +
     ' · ' +
-    d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  );
 }
 
-function LogItem({ item, index }) {
+function LogItem({ item, onDelete }) {
   const isManual = item.type === 'manual';
   return (
     <View style={styles.item}>
@@ -52,16 +58,24 @@ function LogItem({ item, index }) {
         </View>
         <Text style={styles.levelText}>{item.level != null ? `${item.level}%` : ''}</Text>
       </View>
+      {/* Delete button */}
+      <TouchableOpacity
+        style={styles.deleteBtn}
+        onPress={() => onDelete(item.id)}
+        hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+      >
+        <Ionicons name="trash-outline" size={17} color={COLORS.coral} />
+      </TouchableOpacity>
     </View>
   );
 }
 
 export default function LogsScreen({ foodHistory, schedules }) {
   const insets = useSafeAreaInsets();
-  const topPadding = Math.max(insets.top, Platform.OS === 'android' ? (StatusBar.currentHeight || 24) : 16) + 8;
+  const topPadding =
+    Math.max(insets.top, Platform.OS === 'android' ? StatusBar.currentHeight || 24 : 16) + 8;
   const bottomPadding = Math.max(insets.bottom, 24) + 60;
 
-  // Build a combined feed log from foodHistory
   const logs = (foodHistory || [])
     .slice()
     .reverse()
@@ -74,11 +88,54 @@ export default function LogsScreen({ foodHistory, schedules }) {
       scheduleName: h.scheduleName,
     }));
 
+  const handleDeleteOne = (id) => {
+    Alert.alert('Delete Log', 'Remove this feed log entry?', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: async () => {
+          try {
+            await remove(ref(db, `feeder/foodHistory/${id}`));
+          } catch (e) {
+            Alert.alert('Error', 'Could not delete log. Try again.');
+          }
+        },
+      },
+    ]);
+  };
+
+  const handleDeleteAll = () => {
+    if (logs.length === 0) return;
+    Alert.alert('Clear All Logs', 'This will permanently delete all feed history. Are you sure?', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Clear All',
+        style: 'destructive',
+        onPress: async () => {
+          try {
+            await remove(ref(db, 'feeder/foodHistory'));
+          } catch (e) {
+            Alert.alert('Error', 'Could not clear logs. Try again.');
+          }
+        },
+      },
+    ]);
+  };
+
   return (
     <View style={styles.container}>
       <View style={[styles.header, { paddingTop: topPadding }]}>
-        <Text style={styles.title}>Feed Logs</Text>
-        <Text style={styles.subtitle}>{logs.length} events recorded</Text>
+        <View>
+          <Text style={styles.title}>Feed Logs</Text>
+          <Text style={styles.subtitle}>{logs.length} events recorded</Text>
+        </View>
+        {logs.length > 0 && (
+          <TouchableOpacity style={styles.clearBtn} onPress={handleDeleteAll}>
+            <Ionicons name="trash-outline" size={16} color={COLORS.coral} />
+            <Text style={styles.clearBtnText}>Clear All</Text>
+          </TouchableOpacity>
+        )}
       </View>
 
       {logs.length === 0 ? (
@@ -91,7 +148,7 @@ export default function LogsScreen({ foodHistory, schedules }) {
         <FlatList
           data={logs}
           keyExtractor={(item) => item.id}
-          renderItem={({ item, index }) => <LogItem item={item} index={index} />}
+          renderItem={({ item }) => <LogItem item={item} onDelete={handleDeleteOne} />}
           contentContainerStyle={{ padding: 16, paddingBottom: bottomPadding }}
           ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
         />
@@ -106,8 +163,10 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.background,
   },
   header: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    justifyContent: 'space-between',
     paddingHorizontal: 20,
-    paddingTop: 20,
     paddingBottom: 12,
   },
   title: {
@@ -119,6 +178,20 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: COLORS.textLight,
     marginTop: 3,
+  },
+  clearBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    backgroundColor: '#FFF0EC',
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 10,
+  },
+  clearBtnText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: COLORS.coral,
   },
   item: {
     flexDirection: 'row',
@@ -152,6 +225,7 @@ const styles = StyleSheet.create({
   rightCol: {
     alignItems: 'flex-end',
     gap: 4,
+    marginRight: 8,
   },
   badge: {
     borderRadius: 8,
@@ -165,6 +239,9 @@ const styles = StyleSheet.create({
   levelText: {
     fontSize: 11,
     color: COLORS.textLight,
+  },
+  deleteBtn: {
+    padding: 4,
   },
   empty: {
     flex: 1,

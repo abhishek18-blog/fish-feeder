@@ -15,35 +15,52 @@ import {
 import { db, firestore } from '../firebase/config';
 
 /**
- * Calculates the next upcoming feed string from a list of schedules
+ * Calculates the next upcoming feed string from the live list of schedules for TODAY.
+ * Once all of today's scheduled feeds have already passed (e.g. 4:00 PM schedule at 4:15 PM),
+ * returns "Done Today" instead of repeating the already-passed 4:00 PM time.
  */
-function computeNextFeed(schedList) {
+function computeNextFeed(schedList, vacationMode = false) {
+  if (vacationMode) return 'Vacation';
   if (!schedList || schedList.length === 0) return '--:--';
-  const activeScheds = schedList.filter((s) => s.active);
+  const activeScheds = schedList.filter((s) => s && s.active);
   if (activeScheds.length === 0) return 'Paused';
 
   const now = new Date();
   const currentMinutes = now.getHours() * 60 + now.getMinutes();
+  const dayOfWeek = now.getDay(); // 0 = Sun, 1..5 = Mon..Fri, 6 = Sat
 
-  const parsed = activeScheds
+  // Filter schedules that apply to today
+  const todaysScheds = activeScheds.filter((s) => {
+    const freq = (s.frequency || 'Daily').trim();
+    if (freq === 'Mon-Fri' && (dayOfWeek === 0 || dayOfWeek === 6)) return false;
+    if (freq === 'Weekends' && dayOfWeek >= 1 && dayOfWeek <= 5) return false;
+    return true;
+  });
+
+  if (todaysScheds.length === 0) return 'None Today';
+
+  const parsed = todaysScheds
     .map((s) => {
-      let [h, m] = (s.time || '00:00').split(':').map(Number);
-      const ampm = (s.ampm || '').toUpperCase();
+      const cleanTime = (s.time || '00:00').trim();
+      let [h, m] = cleanTime.split(':').map(Number);
+      if (isNaN(h)) h = 0;
+      if (isNaN(m)) m = 0;
+      const ampm = (s.ampm || '').trim().toUpperCase();
       if (ampm === 'PM' && h < 12) h += 12;
       if (ampm === 'AM' && h === 12) h = 0;
       return {
-        minutesFromMidnight: h * 60 + (m || 0),
-        display: `${s.time} ${s.ampm || ''}`.trim(),
+        minutesFromMidnight: h * 60 + m,
+        display: `${cleanTime} ${ampm}`.trim(),
       };
     })
     .sort((a, b) => a.minutesFromMidnight - b.minutesFromMidnight);
 
-  // Find next feed later today
+  // Find next feed later today (strictly after current time)
   const nextToday = parsed.find((p) => p.minutesFromMidnight > currentMinutes);
   if (nextToday) return nextToday.display;
 
-  // Wrap around to earliest feed tomorrow
-  return parsed[0].display;
+  // All scheduled feeds for today have already completed
+  return 'Done Today';
 }
 
 export default function useFeederData() {
@@ -56,7 +73,7 @@ export default function useFeederData() {
     minDistanceCm: 1.0,
     portionSize: 1,
     servoStatus: 'Ready',
-    nextFeed: '08:00 AM',
+    nextFeed: '--:--',
     burnPerDay: 6,
     deviceOnline: true,
     vacationMode: false,
@@ -72,6 +89,19 @@ export default function useFeederData() {
   // Tracks when the user actually tapped "Feed Now" in this app session
   const lastTapTimeRef = useRef(0);
 
+  // Re-evaluate nextFeed every 15 seconds so when the clock passes a schedule time
+  // (e.g. 4:00 PM -> 4:01 PM), "Next Feed" updates automatically in real time
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setFeederData((prev) => {
+        const updatedNext = computeNextFeed(schedules, prev.vacationMode);
+        if (updatedNext === prev.nextFeed) return prev;
+        return { ...prev, nextFeed: updatedNext };
+      });
+    }, 15000);
+    return () => clearInterval(interval);
+  }, [schedules]);
+
   // ── 1. Realtime Database Listeners (Fast hardware sync) ───────────
   useEffect(() => {
     const feederRef = ref(db, 'feeder');
@@ -81,10 +111,11 @@ export default function useFeederData() {
         const val = snap.val();
         if (val) {
           setFeederData((prev) => {
-            const nextFeedVal =
-              val.nextFeed && val.nextFeed !== '--:--'
-                ? val.nextFeed
-                : computeNextFeed(schedules);
+            // Always derive nextFeed from the live schedules in /feeder/schedules
+            const liveSchedList = val.schedules
+              ? Object.entries(val.schedules).map(([id, data]) => ({ id, ...data }))
+              : schedules;
+            const nextFeedVal = computeNextFeed(liveSchedList, val.vacationMode ?? false);
 
             // Only show "Dispensing" if the user actually tapped Feed Now within the last 10s
             const isActivelyFeeding =
@@ -166,10 +197,14 @@ export default function useFeederData() {
           setSchedules(list);
           setFeederData((prev) => ({
             ...prev,
-            nextFeed: computeNextFeed(list),
+            nextFeed: computeNextFeed(list, prev.vacationMode),
           }));
         } else {
           setSchedules([]);
+          setFeederData((prev) => ({
+            ...prev,
+            nextFeed: '--:--',
+          }));
         }
       },
       (error) => {

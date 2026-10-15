@@ -1,40 +1,46 @@
 /**
  * ==============================================================================
- * SmartFish Feeder — ESP8266 Firmware (Automated Schedules + Genuine Ultrasonic)
+ * SmartFish Feeder — ESP8266 Firmware (Automated Schedules + Pololu VL53L0X ToF)
  * ==============================================================================
  * 
  * Hardware Connections:
  *   - Servo PWM Signal : D4 (GPIO2)   [Safe boot pin — DO NOT use D8!]
- *   - HC-SR04 Trigger  : D6 (GPIO12)
- *   - HC-SR04 Echo     : D7 (GPIO13)
- *   - Status LED       : LED_BUILTIN (Active LOW)
+ *   - VL53L0X SDA      : D6 (GPIO12)  [I2C Data]
+ *   - VL53L0X SCL      : D5 (GPIO14)  [I2C Clock]
+ *   - VL53L0X VCC      : 3.3V or 5V
+ *   - VL53L0X GND      : GND
+ *   - Status LED       : LED_BUILTIN  [Active LOW]
+ *   - Yellow LED       : D3 (GPIO0)   -> Blinks during Wi-Fi connect, Solid ON when connected
+ *   - Green LED        : D1 (GPIO5)   -> Blinks while dispensing
+ *   - Red LED          : D2 (GPIO4)   -> Solid ON when idle
  * 
  * Features:
- *   1. Genuine Ultrasonic Sensor Reading (HC-SR04):
- *      - Accurate ping measurement in centimeters.
- *      - Max distance = 5.0 cm (0% empty), Min distance = 1.0 cm (100% full).
- *      - Publishes foodDistanceCm, foodLevel, sensorConnected, lastSensorPing.
- *   2. Automated Schedules (IST UTC+5:30):
- *      - Syncs Indian Standard Time via NTP.
- *      - Automatically checks active schedules from Firebase (/feeder/schedules).
- *      - Dispatches automatic feeds at scheduled times (e.g. 09:43 AM, 06:00 PM).
- *      - Respects Vacation Mode & frequency (Daily, Mon-Fri, Weekends).
- *   3. Real-Time Remote Control:
- *      - Instant manual feed when "Feed Now" is tapped in app.
- *      - Responds to "Ping Sensor Now" requests from app.
+ *   - Real-time continuous VL53L0X distance reading (mm converted to cm)
+ *   - Clock stretch limit configured to 4000µs to prevent ESP8266 I2C timeouts
+ *   - Real-time Firebase sync (updates immediately when food level changes + 5s heartbeat)
+ *   - Multi-AP Wi-Fi fallback ("Batman " and "Abcd")
+ *   - Automated schedules (IST UTC+5:30 via NTP)
  * ==============================================================================
  */
 
+#include <Wire.h>
+#include <VL53L0X.h>
 #include <ESP8266WiFi.h>
+#include <ESP8266WiFiMulti.h>
 #include <FirebaseESP8266.h>
 #include <Servo.h>
 #include <time.h>
 
 // ------------------------------------------------------------------------------
-// 1. Wi-Fi Configuration
+// 1. Wi-Fi Configuration (Dual Networks)
 // ------------------------------------------------------------------------------
-#define WIFI_SSID     "Abcd"
-#define WIFI_PASSWORD "abhi2004"
+#define WIFI_SSID_1     "Batman "
+#define WIFI_PASSWORD_1 "123456789"
+
+#define WIFI_SSID_2     "Abcd"
+#define WIFI_PASSWORD_2 "abhi2004"
+
+ESP8266WiFiMulti wifiMulti;
 
 // ------------------------------------------------------------------------------
 // 2. Firebase Configuration
@@ -46,17 +52,20 @@
 // 3. Hardware Pin Definitions
 // ------------------------------------------------------------------------------
 #define SERVO_PIN        D4          // GPIO2  -> Servo PWM Signal
-#define TRIG_PIN         D6          // GPIO12 -> Ultrasonic Trigger
-#define ECHO_PIN         D7          // GPIO13 -> Ultrasonic Echo
+#define SDA_PIN          D6          // GPIO12 -> VL53L0X I2C Data (SDA)
+#define SCL_PIN          D5          // GPIO14 -> VL53L0X I2C Clock (SCL)
 #define LED_PIN          LED_BUILTIN // Onboard LED (Active LOW)
 #define GREEN_LED_PIN    D1          // GPIO5  -> Green LED: blinks while dispensing
 #define RED_LED_PIN      D2          // GPIO4  -> Red LED: solid ON when idle
+#define YELLOW_LED_PIN   D3          // GPIO0  -> Yellow LED: Blinks connecting, Solid connected
 
 // ------------------------------------------------------------------------------
-// 4. Ultrasonic Sensor Calibration (Max 5.0 cm = 0%, Min 1.0 cm = 100%)
+// 4. Food Level Sensor Calibration & Update Interval
 // ------------------------------------------------------------------------------
 #define DISTANCE_MAX_CM   5.0f   // 5.0 cm = container empty (0%)
 #define DISTANCE_MIN_CM   1.0f   // 1.0 cm or closer = container full (100%)
+#define FOOD_LEVEL_SYNC_INTERVAL_MS 30000UL // Update food level every 30 seconds
+
 
 // ------------------------------------------------------------------------------
 // 5. Schedules Structure
@@ -86,9 +95,11 @@ FirebaseData fbdo; // Single SSL client keeps Keep-Alive warm and saves 20KB RAM
 FirebaseAuth auth;
 FirebaseConfig config;
 Servo feederServo;
+VL53L0X sensor;
 
 unsigned long lastPoll = 0;
-unsigned long lastSensorAndHeartbeat = 0;
+unsigned long lastSensorRead = 0;
+unsigned long lastFirebaseSync = 0;
 unsigned long lastScheduleSync = 0;
 
 int currentFoodLevel = 100;
@@ -101,9 +112,7 @@ bool feedCommandPrimed = false;    // True once we know the current ID (avoids r
 int fbFailCount = 0;               // Consecutive failed Firebase requests
 
 /**
- * Tracks Firebase health. If requests keep failing (SSL session died while Wi-Fi
- * is still up, heap exhausted, etc.) we rebuild the connection, and as a last
- * resort reboot, so the feeder always recovers on its own.
+ * Tracks Firebase health. Reconnects or reboots if connections fail consecutively.
  */
 void noteFirebaseResult(bool ok) {
   if (ok) { fbFailCount = 0; return; }
@@ -125,164 +134,179 @@ void noteFirebaseResult(bool ok) {
 }
 
 // ------------------------------------------------------------------------------
-// 7. Genuine Ultrasonic Ping Functions
+// 7. Robust Pololu VL53L0X Time-of-Flight (ToF) Distance Functions (Single-Shot)
 // ------------------------------------------------------------------------------
 
-/**
- * Executes a genuine hardware ping to the HC-SR04 ultrasonic sensor.
- * Returns distance in centimeters, or -1.0f if timeout / disconnected.
- */
-float pingRawDistanceCm() {
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
+static int tofFailStreak = 0;
 
-  // 25ms timeout (~400cm max range)
-  long duration = pulseIn(ECHO_PIN, HIGH, 25000);
+bool initToFSensor() {
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000); // 100kHz standard I2C speed for ESP8266 stability
+  Wire.setClockStretchLimit(4000); // 4000us clock stretch limit prevents ESP8266 I2C timeout!
+  delay(20);
 
-  if (duration <= 0) {
-    return -1.0f; // Timeout / sensor disconnected
+  // Ping sensor on I2C address 0x29
+  Wire.beginTransmission(0x29);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("⚠️ [VL53L0X] Sensor NOT detected on I2C address 0x29! Check SDA=D6, SCL=D5, VCC, GND.");
+    sensorConnected = false;
+    return false;
   }
 
-  // Sound speed in air: 343 m/s = 0.0343 cm/us (divide by 2 for round-trip)
-  float cm = (duration * 0.0343f) / 2.0f;
-  return cm;
+  sensor.setTimeout(500); // 500ms timeout per measurement
+
+  if (!sensor.init()) {
+    Serial.println("⚠️ [VL53L0X] Failed to detect sensor! (Check VCC=3.3V/5V, GND, SDA=D6, SCL=D5)");
+    sensorConnected = false;
+    return false;
+  }
+
+  // Set measurement timing budget to 50ms for accurate, stable single-shot readings
+  sensor.setMeasurementTimingBudget(50000);
+  sensorConnected = true;
+
+  Serial.println("✅ [VL53L0X] Time-of-Flight sensor initialized successfully on SDA=D6, SCL=D5!");
+  return true;
 }
 
-/**
- * Takes 3 genuine pings and returns the median distance.
- * Filters out single-pulse acoustic reflections from container walls.
- */
 float readGenuineDistanceCm() {
-  float readings[3];
-  int validCount = 0;
-
-  for (int i = 0; i < 3; i++) {
-    float d = pingRawDistanceCm();
-    if (d > 0.4f && d < 35.0f) {
-      readings[validCount++] = d;
-    }
-    delay(15);
-    yield();
-  }
-
-  if (validCount == 0) {
+  // 1. Verify physical I2C connection first
+  Wire.beginTransmission(0x29);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("⚠️ [VL53L0X] I2C communication lost! (Sensor disconnected or wiring loose)");
     sensorConnected = false;
     return -1.0f;
   }
 
-  sensorConnected = true;
+  if (!sensorConnected) {
+    if (!initToFSensor()) {
+      return -1.0f;
+    }
+    delay(30);
+  }
 
-  if (validCount == 1) return readings[0];
-  if (validCount == 2) return (readings[0] + readings[1]) / 2.0f;
+  // 2. Take 3 single-shot samples
+  uint16_t samples[3];
+  int validCount = 0;
+  bool hadOutOfRange = false;
 
-  // Median of 3
-  if ((readings[0] <= readings[1] && readings[1] <= readings[2]) ||
-      (readings[2] <= readings[1] && readings[1] <= readings[0])) return readings[1];
-  if ((readings[1] <= readings[0] && readings[0] <= readings[2]) ||
-      (readings[2] <= readings[0] && readings[0] <= readings[1])) return readings[0];
-  return readings[2];
+  for (int i = 0; i < 3; i++) {
+    uint16_t mm = sensor.readRangeSingleMillimeters();
+
+    // ST API error codes 8190, 8191 or > 1200mm mean no reflective surface in range (empty container)
+    if (mm == 8190 || mm == 8191 || mm > 1200) {
+      hadOutOfRange = true;
+    } else if (!sensor.timeoutOccurred() && mm >= 5 && mm <= 1200 && mm != 65535) {
+      samples[validCount++] = mm;
+    }
+    delay(20);
+    yield();
+  }
+
+  sensorConnected = true; // Hardware is confirmed present on I2C bus
+
+  // If all samples were out of range: laser saw no food surface -> Container Empty (0%)
+  if (validCount == 0 && hadOutOfRange) {
+    Serial.println("ℹ️ [VL53L0X] No surface in range (out-of-range 8190/8191) -> Container is Empty (0%).");
+    return DISTANCE_MAX_CM; // 5.0 cm = 0% Empty
+  }
+
+  if (validCount == 0) {
+    Serial.println("⚠️ [VL53L0X] Measurement timeout on all samples.");
+    return DISTANCE_MAX_CM; // Treat as empty container rather than disconnecting
+  }
+
+  // 3. Compute median of valid samples
+  uint16_t selectedMm = samples[0];
+  if (validCount == 2) {
+    selectedMm = (samples[0] + samples[1]) / 2;
+  } else if (validCount == 3) {
+    if (samples[0] > samples[1]) { uint16_t t = samples[0]; samples[0] = samples[1]; samples[1] = t; }
+    if (samples[1] > samples[2]) { uint16_t t = samples[1]; samples[1] = samples[2]; samples[2] = t; }
+    if (samples[0] > samples[1]) { uint16_t t = samples[0]; samples[0] = samples[1]; samples[1] = t; }
+    selectedMm = samples[1];
+  }
+
+  float distCm = (float)selectedMm / 10.0f; // Convert millimeters to centimeters
+  return distCm;
 }
 
-/**
- * Calculates genuine food level percentage from real ultrasonic distance:
- *   Distance >= 5.0 cm -> 0% (Empty)
- *   Distance <= 1.0 cm -> 100% (Full)
- * Publishes raw distance, percentage & heartbeat in ONE single batched request!
- */
-int measureAndSyncUltrasonic() {
-  float dist = readGenuineDistanceCm();
 
-  FirebaseJson syncJson;
-  syncJson.set("deviceOnline", true);
-  syncJson.set("lastHeartbeat", (int)time(nullptr));
+int measureAndSyncToF(bool forceSync = false) {
+  float dist = readGenuineDistanceCm();
+  unsigned long now = millis();
 
   if (dist < 0.0f) {
-    Serial.println("⚠️ [ULTRASONIC] Sensor read timeout (Check VCC=5V, Trig=D6, Echo=D7)");
-    syncJson.set("sensorConnected", false);
-    Firebase.updateNodeSilent(fbdo, "/feeder", syncJson);
+    // If sensor failed 3 consecutive cycles, inform Firebase once
+    if (!sensorConnected && forceSync) {
+      FirebaseJson syncJson;
+      syncJson.set("sensorConnected", false);
+      syncJson.set("deviceOnline", true);
+      syncJson.set("lastHeartbeat", (int)time(nullptr));
+      Firebase.updateNodeSilent(fbdo, "/feeder", syncJson);
+    }
     return currentFoodLevel;
   }
 
-  currentDistanceCm = dist;
-
-  // Exact linear percentage between 1.0cm (100%) and 5.0cm (0%)
+  // Linear percentage mapping: 1.0cm or closer = 100% full, 5.0cm = 0% empty
   float pct = ((DISTANCE_MAX_CM - dist) / (DISTANCE_MAX_CM - DISTANCE_MIN_CM)) * 100.0f;
   if (pct < 0.0f) pct = 0.0f;
   if (pct > 100.0f) pct = 100.0f;
+  int newFoodLevel = (int)round(pct);
 
-  currentFoodLevel = (int)round(pct);
-
-  Serial.print("📏 [GENUINE PING] Distance: ");
-  Serial.print(currentDistanceCm, 2);
-  Serial.print(" cm | Food Level: ");
-  Serial.print(currentFoodLevel);
+  // Print 30s measurement to Serial Monitor
+  Serial.print("📏 [VL53L0X ToF] Distance: ");
+  Serial.print(dist, 2);
+  Serial.print(" cm (");
+  Serial.print(dist * 10.0f, 0);
+  Serial.print(" mm) | Food Level: ");
+  Serial.print(newFoodLevel);
   Serial.println("%");
 
-  // Sync all genuine readings in ONE single fast packet (instead of 6 separate requests)
+  currentDistanceCm = dist;
+  currentFoodLevel = newFoodLevel;
+  lastFirebaseSync = now;
+
+  // Push updated food level & distance to Firebase
+  FirebaseJson syncJson;
   syncJson.set("foodLevel", currentFoodLevel);
   syncJson.set("foodDistanceCm", currentDistanceCm);
   syncJson.set("sensorConnected", true);
   syncJson.set("lastSensorPing", (int)time(nullptr));
-  Firebase.updateNodeSilent(fbdo, "/feeder", syncJson);
+  syncJson.set("deviceOnline", true);
+  syncJson.set("lastHeartbeat", (int)time(nullptr));
+  bool ok = Firebase.updateNodeSilent(fbdo, "/feeder", syncJson);
+  noteFirebaseResult(ok);
 
   return currentFoodLevel;
 }
+
 
 // ------------------------------------------------------------------------------
 // 8. LED Status Control
 // ------------------------------------------------------------------------------
 
-// Non-blocking green LED blink state (used inside the servo spin loop)
 static unsigned long lastGreenBlink = 0;
 static bool greenLedState = false;
 
-/**
- * Call setIdleLEDs() when nothing is happening:
- *   Red LED   -> solid ON  (D2)
- *   Green LED -> solid OFF (D1)
- */
 void setIdleLEDs() {
   digitalWrite(GREEN_LED_PIN, LOW);  // Green OFF
   digitalWrite(RED_LED_PIN,   HIGH); // Red ON
   greenLedState = false;
 }
 
-/**
- * Call setDispensingLEDs() once at the START of dispensing:
- *   Red LED   -> OFF immediately (D2)
- *   Green LED -> starts blinking (D1) — call tickGreenBlink() in spin loop
- */
 void setDispensingLEDs() {
   digitalWrite(RED_LED_PIN,   LOW);  // Red OFF
-  digitalWrite(GREEN_LED_PIN, HIGH); // Green ON (first half of first blink)
+  digitalWrite(GREEN_LED_PIN, HIGH); // Green ON
   greenLedState = true;
   lastGreenBlink = millis();
 }
 
-/**
- * Call inside the servo spin while-loop to keep green LED blinking
- * at ~200ms interval without using blocking delay
- */
 void tickGreenBlink() {
   if (millis() - lastGreenBlink >= 200) {
     lastGreenBlink = millis();
     greenLedState = !greenLedState;
     digitalWrite(GREEN_LED_PIN, greenLedState ? HIGH : LOW);
-  }
-}
-
-/**
- * Helper: wait for ms while keeping Green LED blinking and Wi-Fi watchdog happy
- */
-void waitWithGreenBlink(unsigned long ms) {
-  unsigned long start = millis();
-  while (millis() - start < ms) {
-    tickGreenBlink();
-    delay(20);
-    yield();
   }
 }
 
@@ -306,35 +330,31 @@ void dispenseFood(int portionSize, String feedLabel = "Manual Feed", String feed
   Serial.println("x portion(s)");
   Serial.println("==================================================");
 
-  // ── 1. LED: Red OFF (D2), Green starts BLINKING (D1) ─────────────────────
+  // 1. Red OFF (D2), Green BLINKS (D1)
   setDispensingLEDs();
-  digitalWrite(LED_PIN, LOW); // Onboard LED ON
+  digitalWrite(LED_PIN, LOW);
 
-  // ── 2. 360° Continuous Servo: Uninterrupted Clockwise Circles ────────────
-  // 1x portion = 1 full 360° clockwise circle (1500 ms)
-  // 2x portion = 2 full 360° clockwise circles (3000 ms), etc.
+  // 2. 360° Continuous Servo rotation
   unsigned long spinDurationMs = (unsigned long)portionSize * 1500UL;
-
   feederServo.attach(SERVO_PIN);
 
   unsigned long start = millis();
   while (millis() - start < spinDurationMs) {
-    feederServo.write(0); // 0 = Full-speed Clockwise on 360° continuous servo
-    tickGreenBlink();     // Blink Green LED on D1 while spinning
+    feederServo.write(0); // 0 = Full-speed Clockwise
+    tickGreenBlink();
     delay(20);
     yield();
   }
 
-  // Stop rotation only AFTER all portion circles are finished
-  feederServo.write(90);  // 90 = STOP on 360° continuous rotation servo
+  feederServo.write(90);  // 90 = STOP
   delay(150);
-  feederServo.detach();   // Detach to stop motor humming while idle
+  feederServo.detach();
 
-  // ── 3. LED: Green OFF (D1), Red back ON (D2 - idle) ──────────────────────
+  // 3. Green OFF (D1), Red back ON (D2)
   setIdleLEDs();
-  digitalWrite(LED_PIN, HIGH); // Onboard LED OFF
+  digitalWrite(LED_PIN, HIGH);
 
-  // ── 4. Immediately unlock App UI ("Ready") with retry ────────────────────
+  // 4. Unlock UI in Firebase
   String spinStr = String(portionSize * 1.5f, 1) + "s servo spin";
   bool readyOk = false;
   for (int attempt = 0; attempt < 4 && !readyOk; attempt++) {
@@ -343,11 +363,9 @@ void dispenseFood(int portionSize, String feedLabel = "Manual Feed", String feed
   }
   noteFirebaseResult(readyOk);
 
-  // Wait 800ms for food surface to settle, then take genuine ultrasonic ping
-  delay(800);
-  measureAndSyncUltrasonic();
+  delay(600);
+  measureAndSyncToF(true); // Force real-time sync after feed
 
-  // Push event to Firebase history
   FirebaseJson historyJson;
   historyJson.set("level", currentFoodLevel);
   historyJson.set("type", feedType);
@@ -364,9 +382,6 @@ void dispenseFood(int portionSize, String feedLabel = "Manual Feed", String feed
 // 10. Schedules Fetching & Time Comparison (IST UTC+5:30)
 // ------------------------------------------------------------------------------
 
-/**
- * Downloads all schedules from Firebase (/feeder/schedules) and parses them
- */
 void syncSchedulesFromFirebase() {
   Serial.println("📅 [SCHEDULES] Fetching schedules from Firebase...");
 
@@ -400,10 +415,10 @@ void syncSchedulesFromFirebase() {
     bool active = d.boolValue;
 
     itemJson.get(d, "time");
-    String timeStr = d.stringValue; // e.g. "9:43" or "08:00"
+    String timeStr = d.stringValue;
 
     itemJson.get(d, "ampm");
-    String ampm = d.stringValue; // "AM" or "PM"
+    String ampm = d.stringValue;
 
     itemJson.get(d, "name");
     String name = d.stringValue;
@@ -440,41 +455,20 @@ void syncSchedulesFromFirebase() {
 
   Serial.print("   ✅ Loaded ");
   Serial.print(totalSchedules);
-  Serial.println(" schedule(s):");
-  for (int i = 0; i < totalSchedules; i++) {
-    Serial.print("      ");
-    Serial.print(i + 1);
-    Serial.print(". \"");
-    Serial.print(schedulesList[i].name);
-    Serial.print("\" -> ");
-    if (schedulesList[i].hour24 < 10) Serial.print("0");
-    Serial.print(schedulesList[i].hour24);
-    Serial.print(":");
-    if (schedulesList[i].minute < 10) Serial.print("0");
-    Serial.print(schedulesList[i].minute);
-    Serial.print(" (");
-    Serial.print(schedulesList[i].active ? "ACTIVE" : "PAUSED");
-    Serial.print(", ");
-    Serial.print(schedulesList[i].frequency);
-    Serial.println(")");
-  }
+  Serial.println(" schedule(s).");
 }
 
-/**
- * Compares current IST time against all active schedules
- */
 void checkAndExecuteSchedules() {
   time_t now = time(nullptr);
-  if (now < 100000) return; // Time not yet synced from NTP
+  if (now <= 1735689600) return; // Only execute schedules when genuine NTP time is synced
+
 
   struct tm* t = localtime(&now);
-  int curHour = t->tm_hour; // 0 - 23
-  int curMin  = t->tm_min;  // 0 - 59
-  int curWday = t->tm_wday; // 0=Sun, 1=Mon, ..., 6=Sat
+  int curHour = t->tm_hour;
+  int curMin  = t->tm_min;
+  int curWday = t->tm_wday;
+  int curDay  = t->tm_yday;
 
-  int curDay  = t->tm_yday; // Day of year (0-365)
-
-  // Avoid running multiple times during the same minute of the same day
   if (curDay == lastFiredDay && curHour == lastFiredHour && curMin == lastFiredMinute) {
     return;
   }
@@ -483,7 +477,6 @@ void checkAndExecuteSchedules() {
     if (!schedulesList[i].active) continue;
 
     if (curHour == schedulesList[i].hour24 && curMin == schedulesList[i].minute) {
-      // Check frequency rules
       String freq = schedulesList[i].frequency;
       bool dayMatches = true;
 
@@ -494,22 +487,20 @@ void checkAndExecuteSchedules() {
       }
 
       if (dayMatches) {
-        // Check vacation mode in Firebase
         bool vacation = false;
         if (Firebase.getBool(fbdo, "/feeder/vacationMode")) {
           vacation = fbdo.boolData();
         }
 
         if (vacation) {
-          Serial.println("🏖️ [VACATION MODE] Schedule skipped because Vacation Mode is ON.");
+          Serial.println("🏖️ [VACATION MODE] Schedule skipped.");
           lastFiredDay = curDay;
           lastFiredHour = curHour;
           lastFiredMinute = curMin;
           return;
         }
 
-        Serial.println();
-        Serial.println("⏰ [ALARM TRIGGERED] Scheduled time reached!");
+        Serial.println("⏰ [ALARM TRIGGERED] Executing scheduled feed!");
         lastFiredDay = curDay;
         lastFiredHour = curHour;
         lastFiredMinute = curMin;
@@ -522,82 +513,98 @@ void checkAndExecuteSchedules() {
 }
 
 // ------------------------------------------------------------------------------
-// 10. Setup
+// 11. Setup
 // ------------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
   delay(1000);
 
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH); // Onboard LED OFF initially
+  digitalWrite(LED_PIN, HIGH);
 
-  // ── External Status LEDs ──────────────────────────────────────────────────
-  pinMode(GREEN_LED_PIN, OUTPUT); // D1 -> Green: blinks while dispensing
-  pinMode(RED_LED_PIN,   OUTPUT); // D2 -> Red:   solid ON while idle
-  setIdleLEDs();                  // Start in idle state: Red ON, Green OFF
-
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
-  digitalWrite(TRIG_PIN, LOW);
+  // Status LEDs
+  pinMode(GREEN_LED_PIN,  OUTPUT); // D1
+  pinMode(RED_LED_PIN,    OUTPUT); // D2
+  pinMode(YELLOW_LED_PIN, OUTPUT); // D3 -> Wi-Fi Status
+  digitalWrite(YELLOW_LED_PIN, LOW);
+  setIdleLEDs();
 
   Serial.println();
   Serial.println("==================================================");
   Serial.println("   🐟 SmartFish Feeder — Automated ESP8266        ");
-  Serial.println("   Ultrasonic: Trig=D6, Echo=D7 (Max 5.0cm)       ");
+  Serial.println("   ToF Sensor: SDA=D6 (GPIO12), SCL=D5 (GPIO14)   ");
   Serial.println("   Servo PWM : D4 (GPIO2)                         ");
-  Serial.println("   Timezone  : Indian Standard Time (IST UTC+5:30)");
+  Serial.println("   LEDs      : Yellow=D3, Green=D1, Red=D2        ");
   Serial.println("==================================================");
 
-  // 1. Connect to Wi-Fi (25s timeout)
-  Serial.print("Connecting to Wi-Fi SSID: ");
-  Serial.println(WIFI_SSID);
+  // 1. Multi-AP Wi-Fi Connection with Yellow LED Blinking
   WiFi.mode(WIFI_STA);
-  WiFi.setSleepMode(WIFI_NONE_SLEEP); // Wi-Fi modem sleep makes the ESP miss commands
-  WiFi.disconnect();
-  delay(100);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  wifiMulti.addAP(WIFI_SSID_1, WIFI_PASSWORD_1);
+  wifiMulti.addAP(WIFI_SSID_2, WIFI_PASSWORD_2);
+
+  Serial.println("Connecting to Wi-Fi (checking Batman & Abcd)...");
 
   unsigned long startWifi = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startWifi < 25000) {
-    delay(400);
-    digitalWrite(LED_PIN, !digitalRead(LED_PIN)); // Blink
+  bool yellowState = false;
+
+  while (wifiMulti.run() != WL_CONNECTED && (millis() - startWifi < 30000)) {
+    // Fast blinking on Yellow LED D3 and onboard LED while connecting
+    yellowState = !yellowState;
+    digitalWrite(YELLOW_LED_PIN, yellowState ? HIGH : LOW);
+    digitalWrite(LED_PIN, yellowState ? LOW : HIGH);
     Serial.print(".");
+    delay(200);
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    digitalWrite(LED_PIN, HIGH); // Off
+    // Wi-Fi established: Yellow LED stays stable ON
+    digitalWrite(YELLOW_LED_PIN, HIGH);
+    digitalWrite(LED_PIN, HIGH);
+
     Serial.println();
-    Serial.println("   ✅ Wi-Fi Connected!");
-    Serial.print("   📶 Signal (RSSI): ");
+    Serial.print("   ✅ Connected to SSID: ");
+    Serial.println(WiFi.SSID());
+    Serial.print("   📶 Signal: ");
     Serial.print(WiFi.RSSI());
     Serial.println(" dBm");
     Serial.print("   🌐 IP Address: ");
     Serial.println(WiFi.localIP());
 
-    // 2. Configure Indian Standard Time (IST = UTC+5:30 = 19800s)
-    Serial.print("   🇮🇳 Syncing Indian Standard Time (IST)...");
-    configTime(19800, 0, "in.pool.ntp.org", "asia.pool.ntp.org", "time.google.com");
+    // 2. Set Baseline Timestamp & Synchronize IST Time via NTP
+    // Setting a baseline timestamp (1735689600 = 2025-01-01 00:00:00 UTC) guarantees that
+    // BearSSL never sees year 1970 even if NTP takes a few extra seconds to resolve.
+    // This permanently prevents "Certificate is expired or not yet valid"!
+    struct timeval tv = { 1735689600, 0 };
+    settimeofday(&tv, nullptr);
+
+    Serial.print("   🇮🇳 Syncing Indian Standard Time (IST)");
+    configTime(19800, 0, "time.google.com", "pool.ntp.org", "asia.pool.ntp.org");
     time_t now = time(nullptr);
     int retry = 0;
-    while (now < 100000 && retry < 20) {
+    while (now <= 1735689600 && retry < 40) {
       delay(200);
+      Serial.print(".");
       now = time(nullptr);
       retry++;
     }
-    if (now > 100000) {
+    if (now > 1735689600) {
       Serial.println(" synced!");
       Serial.print("   ⏰ Current IST Time: ");
       Serial.println(ctime(&now));
     } else {
-      Serial.println(" (NTP pending)");
+      Serial.println(" (NTP syncing in background; baseline active for SSL)");
     }
+
   } else {
-    Serial.println();
-    Serial.println("   ❌ WI-FI FAILED TO CONNECT! (Check 2.4 GHz band & password)");
+    // Failed: Turn Yellow LED off to indicate no connection
+    digitalWrite(YELLOW_LED_PIN, LOW);
+    digitalWrite(LED_PIN, HIGH);
+    Serial.println("\n   ❌ Wi-Fi connection timed out!");
   }
 
-  // 3. Initialize Firebase Realtime Database (Single Keep-Alive SSL Socket)
-  Serial.print("Connecting to Firebase Database...");
+  // 3. Initialize Firebase
+  Serial.print("Connecting to Firebase...");
   config.host = FIREBASE_HOST;
   config.signer.tokens.legacy_token = FIREBASE_AUTH;
   fbdo.setResponseSize(2048);
@@ -615,23 +622,18 @@ void setup() {
   } else {
     String err = fbdo.errorReason();
     Serial.println(" ⚠️ Warning: " + err);
-    // If Web API key caused auth parse failure, retry with empty legacy token for public test rules
     if (err.indexOf("auth") >= 0 || err.indexOf("token") >= 0 || err.indexOf("401") >= 0 || err.indexOf("Unauthorized") >= 0) {
-      Serial.println("   Retrying with public rule access (clearing legacy token)...");
       config.signer.tokens.legacy_token = "";
       Firebase.begin(&config, &auth);
       if (Firebase.setBool(fbdo, "/feeder/deviceOnline", true)) {
-        Serial.println("   ✅ Connected to Firebase successfully with public rules!");
-      } else {
-        Serial.println("   ❌ Still unable to write: " + fbdo.errorReason());
-        Serial.println("   👉 Please check Firebase Realtime Database Rules or paste your Database Secret.");
+        Serial.println("   ✅ Connected with public rules!");
       }
     }
   }
 
-  // 4. Initial Genuine Ultrasonic Measurement & State Sync
-  Serial.println("Taking initial ultrasonic ping...");
-  measureAndSyncUltrasonic();
+  // 4. Initialize Pololu VL53L0X Time-of-Flight Sensor (after Wi-Fi/Firebase so no unread interrupt lockup)
+  initToFSensor();
+  measureAndSyncToF(true);
 
   FirebaseJson initJson;
   initJson.set("servoStatus", "Ready");
@@ -644,39 +646,41 @@ void setup() {
     if (p >= 1 && p <= 5) currentPortionSize = p;
   }
 
-  // Remember the current command ID so an old tap isn't replayed after a reboot
   if (Firebase.getInt(fbdo, "/feeder/feedCommand")) {
     lastFeedCommand = fbdo.intData();
     feedCommandPrimed = true;
   }
 
-  // 5. Download Schedules immediately on boot
+  // 5. Initial Schedule Sync
   syncSchedulesFromFirebase();
 
+  lastSensorRead = millis();
+  lastScheduleSync = millis() + 15000; // Offset by 15s so sensor sync and schedule sync alternate cleanly!
+
   Serial.println("==================================================");
-  Serial.println("✅ Feeder Active! Monitoring schedules & app...");
+  Serial.println("✅ Feeder Active! Food level updates every 30s...");
   Serial.println("==================================================");
 }
 
 // ------------------------------------------------------------------------------
-// 11. Main Loop (Ultra-fast single-request polling)
+// 12. Main Loop
 // ------------------------------------------------------------------------------
 void loop() {
   yield();
 
-  if (WiFi.status() != WL_CONNECTED) {
+  // Automatic Wi-Fi reconnection handling
+  if (wifiMulti.run() != WL_CONNECTED) {
+    digitalWrite(YELLOW_LED_PIN, LOW); // Yellow OFF if Wi-Fi drops
     delay(500);
     return;
+  } else {
+    digitalWrite(YELLOW_LED_PIN, HIGH); // Solid ON when healthy
   }
 
   unsigned long nowMs = millis();
 
-  // ── 1. Check for "Feed Now" every 400ms ────────────────────────────────────
-  // The app writes a NEW unique feedCommand ID on every tap. We act whenever the
-  // ID differs from the last one we handled. Unlike the old "servoStatus ==
-  // Dispensing" check, this can't be lost if the ESP was busy (sensor / schedule
-  // sync) or if the app's timeout reset servoStatus to "Ready" in the meantime.
-  if (nowMs - lastPoll >= 400) {
+  // 1. Check for "Feed Now" command every 500ms (fast response, no SSL socket clogging)
+  if (nowMs - lastPoll >= 500) {
     lastPoll = nowMs;
 
     if (!isDispensingNow) {
@@ -692,7 +696,6 @@ void loop() {
           lastFeedCommand = cmd;
           Serial.println("⚡ [FEED NOW] New command received from App!");
 
-          // Portion is written by the app together with the command — read it fresh
           if (Firebase.getInt(fbdo, "/feeder/portionSize")) {
             int p = fbdo.intData();
             if (p >= 1 && p <= 5) currentPortionSize = p;
@@ -703,7 +706,33 @@ void loop() {
     }
   }
 
-  // ── Memory watchdog: SSL needs plenty of heap; reboot before we hang ──────
+  // 2. Measure & Update Food Level every 30 SECONDS
+  if (nowMs - lastSensorRead >= FOOD_LEVEL_SYNC_INTERVAL_MS) {
+    lastSensorRead = nowMs;
+    if (!isDispensingNow) {
+      measureAndSyncToF(false);
+
+      if (Firebase.getInt(fbdo, "/feeder/portionSize")) {
+        int p = fbdo.intData();
+        if (p >= 1 && p <= 5) currentPortionSize = p;
+      }
+    }
+  }
+
+  // Check if user tapped "Ping Sensor Now" in app (checks every 2 seconds)
+  static unsigned long lastPingCheck = 0;
+  if (nowMs - lastPingCheck >= 2000) {
+    lastPingCheck = nowMs;
+    if (!isDispensingNow) {
+      if (Firebase.getBool(fbdo, "/feeder/triggerSensorRead") && fbdo.boolData()) {
+        Firebase.setBool(fbdo, "/feeder/triggerSensorRead", false);
+        Serial.println("📡 [APP PING] Immediate sensor read requested by App!");
+        measureAndSyncToF(true);
+      }
+    }
+  }
+
+  // 3. Heap monitor
   static unsigned long lastHeapCheck = 0;
   if (nowMs - lastHeapCheck >= 5000) {
     lastHeapCheck = nowMs;
@@ -717,31 +746,14 @@ void loop() {
     }
   }
 
-  // ── 2. Check Schedules Every 1 Second (Local RAM check — 0 network cost!) ─
+  // 4. Check Schedules every 1s (local RAM comparison, 0 network cost)
   static unsigned long lastClockTick = 0;
   if (nowMs - lastClockTick >= 1000) {
     lastClockTick = nowMs;
     checkAndExecuteSchedules();
   }
 
-  // ── 3. Batched Ultrasonic Ping + Heartbeat + Portion Sync Every 15s ───────
-  if (nowMs - lastSensorAndHeartbeat >= 15000) {
-    lastSensorAndHeartbeat = nowMs;
-    if (!isDispensingNow) {
-      measureAndSyncUltrasonic();
-
-      // Sync portionSize & check if manual sensor read was requested
-      if (Firebase.getInt(fbdo, "/feeder/portionSize")) {
-        int p = fbdo.intData();
-        if (p >= 1 && p <= 5) currentPortionSize = p;
-      }
-      if (Firebase.getBool(fbdo, "/feeder/triggerSensorRead") && fbdo.boolData()) {
-        Firebase.setBool(fbdo, "/feeder/triggerSensorRead", false);
-      }
-    }
-  }
-
-  // ── 4. Re-Sync Schedules From Firebase Every 30 Seconds ───────────────────
+  // 5. Re-sync Schedules from Firebase every 30s (offset by 15s from food level sync)
   if (nowMs - lastScheduleSync >= 30000) {
     lastScheduleSync = nowMs;
     if (!isDispensingNow) {

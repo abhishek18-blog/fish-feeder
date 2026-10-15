@@ -13,6 +13,13 @@ import {
   StatusBar,
   RefreshControl,
 } from 'react-native';
+
+function getGreeting() {
+  const hour = new Date().getHours();
+  if (hour < 12) return 'Good Morning 🌅';
+  if (hour < 17) return 'Good Afternoon ☀️';
+  return 'Good Evening 🌙';
+}
 import { Ionicons, MaterialCommunityIcons, Feather } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { COLORS } from '../theme/colors';
@@ -54,7 +61,8 @@ export default function HomeScreen({
   feedNow,
   setPortionSize,
   refreshSensorReading,
-  navigation,
+  user,
+  onSignOut,
 }) {
   const insets = useSafeAreaInsets();
   const [chartRange, setChartRange] = useState('7D');
@@ -92,13 +100,6 @@ export default function HomeScreen({
     }
   };
 
-  const lastTime = feederData.lastDispense?.timestamp
-    ? new Date(feederData.lastDispense.timestamp).toLocaleTimeString([], {
-        hour: '2-digit',
-        minute: '2-digit',
-      })
-    : '--:--';
-
   const isDispensing = feeding;
 
   return (
@@ -120,8 +121,11 @@ export default function HomeScreen({
     >
       {/* ── Header ─────────────────────────────────────────── */}
       <View style={styles.header}>
-        <View>
-          <Text style={styles.title}>My Aquarium Feeder</Text>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.greeting}>{getGreeting()}</Text>
+          <Text style={styles.title}>
+            {user?.displayName ? user.displayName.split(' ')[0] + "'s Aquarium" : 'My Aquarium Feeder'}
+          </Text>
           <View style={styles.onlineRow}>
             <View
               style={[
@@ -135,18 +139,29 @@ export default function HomeScreen({
                 { color: feederData.deviceOnline ? COLORS.online : COLORS.coral },
               ]}
             >
-              {feederData.deviceOnline ? 'Online' : 'Offline'}
+              {feederData.deviceOnline ? 'Feeder Online' : 'Feeder Offline'}
             </Text>
           </View>
         </View>
 
-        <TouchableOpacity
-          style={styles.settingsBtn}
-          onPress={onRefresh}
-          activeOpacity={0.7}
-        >
-          <Feather name="refresh-cw" size={18} color={COLORS.teal} />
-        </TouchableOpacity>
+        <View style={{ flexDirection: 'row', gap: 8 }}>
+          <TouchableOpacity
+            style={styles.settingsBtn}
+            onPress={onRefresh}
+            activeOpacity={0.7}
+          >
+            <Feather name="refresh-cw" size={18} color={COLORS.teal} />
+          </TouchableOpacity>
+          {onSignOut && (
+            <TouchableOpacity
+              style={[styles.settingsBtn, { backgroundColor: '#FFF0EC' }]}
+              onPress={onSignOut}
+              activeOpacity={0.7}
+            >
+              <Ionicons name="log-out-outline" size={18} color={COLORS.coral} />
+            </TouchableOpacity>
+          )}
+        </View>
       </View>
 
       {/* ── 1. Donut gauge (Driven by Ultrasonic Sensor) ───── */}
@@ -154,10 +169,9 @@ export default function HomeScreen({
         <DonutChart
           percentage={feederData.foodLevel}
           burnPerDay={feederData.burnPerDay}
-          distanceCm={feederData.foodDistanceCm}
         />
 
-        {/* Genuine Sensor Ping Badge */}
+        {/* Sensor Connection Badge */}
         <View style={styles.sensorPill}>
           <MaterialCommunityIcons
             name="radar"
@@ -171,7 +185,7 @@ export default function HomeScreen({
             ]}
           >
             {feederData.sensorConnected !== false
-              ? `Genuine Sensor: ${feederData.foodDistanceCm != null ? feederData.foodDistanceCm.toFixed(1) : '1.0'} cm / 5.0 cm`
+              ? 'Ultrasonic Sensor Active'
               : '⚠️ Sensor Disconnected (Check Wiring)'}
           </Text>
         </View>
@@ -190,13 +204,13 @@ export default function HomeScreen({
       <View style={styles.statsRow}>
         <StatCard
           icon={<Ionicons name="flame" size={12} color={COLORS.coral} />}
-          label="Burn"
+          label="Burn Rate"
           value={`~${feederData.burnPerDay}%/day`}
         />
         <StatCard
           icon={<MaterialCommunityIcons name="radar" size={13} color={COLORS.tealLight} />}
-          label="Sensor Ping"
-          value={feederData.foodDistanceCm != null ? `${feederData.foodDistanceCm.toFixed(1)} cm` : '5.0 cm'}
+          label="Food Level"
+          value={`${feederData.foodLevel ?? '--'}%`}
         />
         <StatCard
           icon={<Ionicons name="time-outline" size={12} color={COLORS.tealLight} />}
@@ -254,24 +268,6 @@ export default function HomeScreen({
           </View>
         </View>
       </View>
-
-      {/* ── 5. Last Dispense Status ────────────────────────── */}
-      <View style={styles.lastDispense}>
-        <View style={styles.lastDispenseLeft}>
-          <View style={styles.lastDispenseIcon}>
-            <MaterialCommunityIcons name="history" size={20} color={COLORS.tealLight} />
-          </View>
-          <View>
-            <Text style={styles.lastDispenseTitle}>Last dispense</Text>
-            <Text style={styles.lastDispenseSub}>Today · {lastTime}</Text>
-          </View>
-        </View>
-        <View style={styles.spinBadge}>
-          <Text style={styles.spinBadgeText}>
-            {feederData.lastDispense?.servoSpin ?? '1.5s servo spin'}
-          </Text>
-        </View>
-      </View>
     </ScrollView>
   );
 }
@@ -289,9 +285,15 @@ const styles = StyleSheet.create({
     paddingBottom: 8,
   },
   title: {
-    fontSize: 22,
+    fontSize: 20,
     fontWeight: '800',
     color: COLORS.textDark,
+  },
+  greeting: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: COLORS.teal,
+    marginBottom: 2,
   },
   onlineRow: {
     flexDirection: 'row',
